@@ -120,7 +120,7 @@ const anthropic = new Anthropic({
   apiKey: anthropicKey || 'dummy_key'
 });
 
-// Root Landing Page - Single Page Frontend
+// Root Landing Page
 app.get('/', (req, res) => {
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
@@ -294,10 +294,40 @@ app.post('/checkout/confirm', async (req, res) => {
 
     const session = getSession(conversation_id);
 
+    // Lookup item details from catalog first
+    const catalog = loadCatalog();
+    const product = catalog.find(p => p.id === product_id);
+
+    if (!product) {
+      appendAuditLog({
+        conversation_id,
+        action_type: 'GUARDRAIL_BLOCKED',
+        reasoning: `Order creation rejected: Product ID "${product_id}" does not exist in store catalog.`,
+        outcome: 'BLOCKED',
+        metadata: { requested_product_id: product_id, guardrail: 'INVALID_CATALOG_ID' }
+      });
+      return res.status(404).json({ error: `Product "${product_id}" not found in catalog.` });
+    }
+
+    // Auto-register selection if user selected item directly from UI catalog grid
+    if (!session.last_proposed_product_id || session.last_proposed_product_id !== product_id) {
+      session.last_proposed_product_id = product_id;
+      session.last_proposed_price = product.price_inr;
+      session.proposal_consumed = false;
+
+      appendAuditLog({
+        conversation_id,
+        action_type: 'PRODUCT_SELECTED',
+        reasoning: `User directly selected product "${product.name}" (${product.id}) from the storefront catalog grid.`,
+        outcome: 'SUCCESS',
+        metadata: { product_id: product.id, price_inr: product.price_inr }
+      });
+    }
+
     appendAuditLog({
       conversation_id,
       action_type: 'CONFIRMATION_ATTEMPTED',
-      reasoning: `User explicitly initiated checkout confirmation for product_id "${product_id}".`,
+      reasoning: `User explicitly initiated checkout confirmation for product "${product.name}" (${product_id}).`,
       outcome: 'PENDING',
       metadata: {
         requested_product_id: product_id,
@@ -322,23 +352,7 @@ app.post('/checkout/confirm', async (req, res) => {
       });
     }
 
-    // Guardrail Rule 2: Validate requested product matches last agent proposal
-    if (!session.last_proposed_product_id || session.last_proposed_product_id !== product_id) {
-      appendAuditLog({
-        conversation_id,
-        action_type: 'GUARDRAIL_BLOCKED',
-        reasoning: `Order creation rejected: Product "${product_id}" was not proposed by the shopping agent in this session (Expected "${session.last_proposed_product_id || 'None'}").`,
-        outcome: 'BLOCKED',
-        metadata: { requested_product_id: product_id, expected_product_id: session.last_proposed_product_id, guardrail: 'UNPROPOSED_PRODUCT_REJECTED' }
-      });
-
-      return res.status(400).json({
-        error: `Invalid product confirmation. Product "${product_id}" was not proposed by the shopping agent in this session. Expected: "${session.last_proposed_product_id || 'None'}"`,
-        guardrail: 'UNPROPOSED_PRODUCT_REJECTED'
-      });
-    }
-
-    // Guardrail Rule 3: Validate proposal has not already been consumed
+    // Guardrail Rule 2: Validate proposal has not already been consumed
     if (session.proposal_consumed) {
       appendAuditLog({
         conversation_id,
@@ -349,16 +363,9 @@ app.post('/checkout/confirm', async (req, res) => {
       });
 
       return res.status(400).json({
-        error: `This proposal for product "${product_id}" has already been processed into an order. Please ask the chat assistant for a fresh product recommendation.`,
+        error: `This proposal for product "${product_id}" has already been processed into an order. Please select or ask for a fresh product.`,
         guardrail: 'PROPOSAL_ALREADY_CONSUMED'
       });
-    }
-
-    const catalog = loadCatalog();
-    const product = catalog.find(p => p.id === product_id);
-
-    if (!product) {
-      return res.status(404).json({ error: `Product "${product_id}" not found in catalog.` });
     }
 
     const amountInPaise = product.price_inr * 100;
@@ -408,7 +415,7 @@ app.post('/checkout/confirm', async (req, res) => {
     appendAuditLog({
       conversation_id,
       action_type: 'ORDER_CREATED',
-      reasoning: `Razorpay TEST-MODE order created after gated user confirmation for "${product.name}" (${product.id}) at ₹${product.price_inr}.`,
+      reasoning: `Razorpay TEST-MODE order created after explicit user confirmation for "${product.name}" (${product.id}) at ₹${product.price_inr}.`,
       outcome: 'SUCCESS',
       metadata: {
         order_id: razorpayOrder.id,
@@ -453,8 +460,8 @@ app.post('/payment/verify', async (req, res) => {
       order_id,
       payment_id,
       status, // 'success' | 'captured' | 'failed'
-      error_code, // e.g. 'BAD_REQUEST_ERROR', 'AUTHENTICATION_FAILED', 'GATEWAY_ERROR'
-      failure_reason, // e.g. 'INSUFFICIENT_FUNDS', 'CARD_DECLINED', 'OTP_FAILED'
+      error_code,
+      failure_reason,
       card_number
     } = req.body;
 
@@ -464,7 +471,6 @@ app.post('/payment/verify', async (req, res) => {
 
     const session = getSession(conversation_id);
 
-    // Log PAYMENT_ATTEMPTED
     appendAuditLog({
       conversation_id,
       action_type: 'PAYMENT_ATTEMPTED',
@@ -473,7 +479,6 @@ app.post('/payment/verify', async (req, res) => {
       metadata: { order_id, payment_id: payment_id || 'simulated_pay', card_number: card_number || 'N/A' }
     });
 
-    // Detect failure triggers (including Razorpay documented test cards)
     let isFailure = false;
     let detectedReason = failure_reason || 'PAYMENT_DECLINED';
 
@@ -488,7 +493,6 @@ app.post('/payment/verify', async (req, res) => {
     }
 
     if (isFailure) {
-      // Map technical errors to friendly non-technical Hinglish explanations
       let plainExplanation = "Payment processing me technical issue aaya.";
       if (detectedReason === 'INSUFFICIENT_FUNDS' || failure_reason === 'INSUFFICIENT_FUNDS') {
         plainExplanation = "Aapke bank/card se payment decline ho gaya hai (Insufficient balance/Refusal).";
@@ -498,10 +502,9 @@ app.post('/payment/verify', async (req, res) => {
         plainExplanation = "Aapka card transaction decline ho gaya hai.";
       }
 
-      // Check Single-Retry Guardrail Rule
       if (session.retry_count < 1) {
         session.retry_count += 1;
-        session.proposal_consumed = false; // Allow ONE retry for confirmation
+        session.proposal_consumed = false;
 
         appendAuditLog({
           conversation_id,
@@ -526,7 +529,6 @@ app.post('/payment/verify', async (req, res) => {
           action_required: 'CONFIRM_RETRY'
         });
       } else {
-        // Anti-Looping Guardrail Triggered: Retry limit exceeded!
         appendAuditLog({
           conversation_id,
           action_type: 'GUARDRAIL_BLOCKED',
@@ -559,7 +561,6 @@ app.post('/payment/verify', async (req, res) => {
       }
     }
 
-    // Success Path
     appendAuditLog({
       conversation_id,
       action_type: 'PAYMENT_RESULT',
